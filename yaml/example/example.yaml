@@ -1,0 +1,44 @@
+---
+apiVersion: shoebill.badhouseplants.net/v1alpha1
+kind: ConfigSet
+metadata:
+  name: test
+spec:
+  targets:
+    - name: app-connection-string
+      target:
+        kind: Secret
+        name: app-connection-string
+  inputs:
+    - name: PASSWORD
+      from:
+        kind: Secret
+        name: database-secret
+        key: PASSWORD
+    - name: USERNAME
+      from:
+        kind: Secret
+        name: database-secret
+        key: USERNAME
+    - name: DATABASE
+      from:
+        kind: Secret
+        name: database-secret
+        key: DATABASE
+    - name: PROTO
+      from:
+        kind: ConfigMap
+        name: database-configmap
+        key: PROTOCOL
+  templates:
+    - name: CONNECTION
+      template: "{{ PROTO }}:{{ USERNAME }}:{{ PASSWORD }}/{{ DATABASE }}"
+      target: app-connection-string
+    - name: IS_POSTGRES
+      template: |
+        {{#if (eq PROTO "postgresql") }}
+        true
+        {{ else }}
+        false
+        {{/if}}
+      target: app-connection-string
