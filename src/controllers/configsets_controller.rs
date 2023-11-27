@@ -219,7 +219,6 @@ impl ConfigSet {
             let var = reg
                 .render_template(template.template.as_str(), &inputs)
                 .unwrap();
-            info!("result is {}", var);
             match self
                 .spec
                 .targets
@@ -302,7 +301,6 @@ impl ConfigSet {
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action> {
-        info!("removing, not installing");
         Ok::<Action, Error>(Action::await_change())
     }
 }
