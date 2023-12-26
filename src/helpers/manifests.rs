@@ -12,7 +12,7 @@ use kube::{core::ObjectMeta, CustomResourceExt, ResourceExt};
 
 use crate::api::v1alpha1::configsets_api::ConfigSet;
 
-pub fn generate_kube_manifests(namespace: String) {
+pub fn generate_kube_manifests(namespace: String, image: String, image_tag: String) {
     print!("---\n{}", serde_yaml::to_string(&ConfigSet::crd()).unwrap());
     print!(
         "---\n{}",
@@ -29,7 +29,12 @@ pub fn generate_kube_manifests(namespace: String) {
 
     print!(
         "---\n{}",
-        serde_yaml::to_string(&prepare_deployment(namespace.clone())).unwrap()
+        serde_yaml::to_string(&prepare_deployment(
+            namespace.clone(),
+            image.clone(),
+            image_tag.clone()
+        ))
+        .unwrap()
     )
 }
 
@@ -119,7 +124,7 @@ fn prepare_cluster_role_binding(namespace: String) -> ClusterRoleBinding {
     }
 }
 
-fn prepare_deployment(namespace: String) -> Deployment {
+fn prepare_deployment(namespace: String, image: String, image_tag: String) -> Deployment {
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
     labels.insert("container".to_string(), "shoebill-controller".to_string());
 
@@ -145,8 +150,8 @@ fn prepare_deployment(namespace: String) -> Deployment {
                     containers: vec![Container {
                         command: Some(vec!["/shoebill".to_string()]),
                         args: Some(vec!["controller".to_string()]),
-                        image: Some("shoebill".to_string()),
-                        image_pull_policy: Some("Never".to_string()),
+                        image: Some(format!("{}:{}", image, image_tag)),
+                        image_pull_policy: Some("IfNotPresent".to_string()),
                         name: "shoebill-controller".to_string(),
                         env: Some(vec![EnvVar {
                             name: "RUST_LOG".to_string(),

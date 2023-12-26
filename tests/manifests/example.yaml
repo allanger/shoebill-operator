@@ -10,6 +10,11 @@ spec:
         kind: Secret
         name: app-connection-string
   inputs:
+    - name: PROTO
+      from:
+        kind: ConfigMap
+        name: database-configmap
+        key: PROTOCOL
     - name: PASSWORD
       from:
         kind: Secret
@@ -25,11 +30,6 @@ spec:
         kind: Secret
         name: database-secret
         key: DATABASE
-    - name: PROTO
-      from:
-        kind: ConfigMap
-        name: database-configmap
-        key: PROTOCOL
   templates:
     - name: CONNECTION
       template: "{{ PROTO }}:{{ USERNAME }}:{{ PASSWORD }}/{{ DATABASE }}"

@@ -25,9 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Manifests(args) => {
-            helpers::manifests::generate_kube_manifests(args.namespace.clone())
-        }
+        Commands::Manifests(args) => helpers::manifests::generate_kube_manifests(
+            args.namespace.clone(),
+            args.image.clone(),
+            args.tag.clone(),
+        ),
         Commands::Controller(args) => {
             // Initiatilize Kubernetes controller state
             let controller = configsets_controller::setup();

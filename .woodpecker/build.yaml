@@ -1,0 +1,47 @@
+# Build a container image
+when:
+  event:
+    - push
+services:
+  docker:
+    image: docker:dind
+    commands:
+      - echo "1" >  /proc/sys/net/ipv4/ip_forward
+      - dockerd -H tcp://0.0.0.0:2375 --tls=false
+    privileged: true
+    ports:
+      - 2375
+      - 16443
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 500Mi
+            cpu: 200m
+          limits:
+            memory: 1000Mi
+            cpu: 1000m
+steps:
+  build:
+    image: git.badhouseplants.net/badhouseplants/badhouseplants-builder:555262114ea81f6f286010474527f419b56d33a3
+    name: Build shoebill operator image
+    privileged: true
+    environment:
+      - PACKAGE_NAME=allanger/shoebill-operator
+    commands:
+      - |
+        if [[ "${CI_COMMIT_TAG}" ]]; then
+          export CUSTOM_TAG="${CI_COMMIT_TAG}";
+        fi
+      - build-container
+    secrets:
+      - gitea_token
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 500Mi
+            cpu: 200m
+          limits:
+            memory: 1000Mi
+            cpu: 1000m

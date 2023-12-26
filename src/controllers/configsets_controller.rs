@@ -1,8 +1,11 @@
-use crate::api::v1alpha1::configsets_api::ConfigSet;
+use crate::api::v1alpha1::configsets_api::{
+    ConfigSet, Input, InputWithName, TargetWithName, Templates,
+};
 use futures::StreamExt;
 use handlebars::Handlebars;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
-use k8s_openapi::ByteString;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::{ByteString, NamespaceResourceScope};
 use kube::api::{ListParams, PostParams};
 use kube::core::{Object, ObjectMeta};
 use kube::error::ErrorResponse;
@@ -10,6 +13,8 @@ use kube::runtime::controller::Action;
 use kube::runtime::watcher::Config;
 use kube::runtime::Controller;
 use kube::{Api, Client, CustomResource};
+use kube_client::core::DynamicObject;
+use kube_client::Resource;
 use log::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,6 +23,7 @@ use std::str::{from_utf8, Utf8Error};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("SerializationError: {0}")]
@@ -31,8 +37,8 @@ pub enum Error {
     // so boxing this error to break cycles
     FinalizerError(#[source] Box<kube::runtime::finalizer::Error<Error>>),
 
-    #[error("IllegalDocument")]
-    IllegalDocument,
+    #[error("IllegalConfigSet")]
+    IllegalConfigSet,
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl Error {
@@ -85,6 +91,208 @@ fn error_policy(doc: Arc<ConfigSet>, error: &Error, ctx: Arc<Context>) -> Action
     Action::requeue(Duration::from_secs(5 * 60))
 }
 
+fn get_secret_api(client: Client, namespace: String) -> Api<Secret> {
+    Api::namespaced(client, &namespace)
+}
+
+fn get_configmap_api(client: Client, namespace: String) -> Api<ConfigMap> {
+    Api::namespaced(client, &namespace)
+}
+
+async fn gather_inputs(
+    client: Client,
+    namespace: String,
+    inputs: Vec<InputWithName>,
+) -> Result<HashMap<String, String>> {
+    let mut result: HashMap<String, String> = HashMap::new();
+    for i in inputs {
+        info!("populating data from input {}", i.name);
+        match i.from.kind {
+            crate::api::v1alpha1::configsets_api::Kinds::Secret => {
+                let secret: String = match get_secret_api(client.clone(), namespace.clone())
+                    .get(&i.from.name)
+                    .await
+                {
+                    Ok(s) => {
+                        let data = s.data.clone().unwrap();
+                        let value = match data.get(i.from.key.as_str()) {
+                            Some(data) => match from_utf8(&data.0) {
+                                Ok(data) => data,
+                                Err(_) => return Err(Error::IllegalConfigSet),
+                            },
+                            None => return Err(Error::IllegalConfigSet),
+                        };
+                        value.to_string()
+                    }
+                    Err(err) => {
+                        error!("{err}");
+                        return Err(Error::KubeError(err));
+                    }
+                };
+                result.insert(i.from.key, secret);
+            }
+            crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
+                let configmap: String = match get_configmap_api(client.clone(), namespace.clone())
+                    .get(&i.from.name)
+                    .await
+                {
+                    Ok(cm) => {
+                        let data = cm.data.unwrap();
+                        let value = match data.get(i.from.key.as_str()) {
+                            Some(data) => data,
+                            None => return Err(Error::IllegalConfigSet),
+                        };
+                        value.to_string()
+                    }
+                    Err(err) => {
+                        error!("{err}");
+                        return Err(Error::KubeError(err));
+                    }
+                };
+                result.insert(i.name, configmap);
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn gather_targets(
+    client: Client,
+    namespace: String,
+    targets: Vec<TargetWithName>,
+    owner_reference: Vec<OwnerReference>,
+) -> Result<(HashMap<String, Secret>, HashMap<String, ConfigMap>)> {
+    let mut target_secrets: HashMap<String, Secret> = HashMap::new();
+    let mut target_configmaps: HashMap<String, ConfigMap> = HashMap::new();
+    for target in targets {
+        match target.target.kind {
+            crate::api::v1alpha1::configsets_api::Kinds::Secret => {
+                let api = get_secret_api(client.clone(), namespace.clone());
+                match api.get_opt(&target.target.name).await {
+                    Ok(sec_opt) => match sec_opt {
+                        Some(sec) => target_secrets.insert(target.name, sec),
+                        None => {
+                            let empty_data: BTreeMap<String, ByteString> = BTreeMap::new();
+                            let new_secret: Secret = Secret {
+                                data: Some(empty_data),
+                                metadata: ObjectMeta {
+                                    name: Some(target.target.name),
+                                    namespace: Some(namespace.clone()),
+                                    owner_references: Some(owner_reference.clone()),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            };
+                            match api.create(&PostParams::default(), &new_secret).await {
+                                Ok(sec) => target_secrets.insert(target.name, sec),
+                                Err(err) => {
+                                    error!("{err}");
+                                    return Err(Error::KubeError(err));
+                                }
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        error!("{err}");
+                        return Err(Error::KubeError(err));
+                    }
+                };
+            }
+            crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
+                let api = get_configmap_api(client.clone(), namespace.clone());
+                match api.get_opt(&target.target.name).await {
+                    Ok(cm_opt) => match cm_opt {
+                        Some(cm) => target_configmaps.insert(target.name, cm),
+                        None => {
+                            let empty_data: BTreeMap<String, String> = BTreeMap::new();
+                            let new_configmap: ConfigMap = ConfigMap {
+                                data: Some(empty_data),
+                                metadata: ObjectMeta {
+                                    name: Some(target.target.name),
+                                    namespace: Some(namespace.clone()),
+                                    owner_references: Some(owner_reference.clone()),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            };
+                            match api.create(&PostParams::default(), &new_configmap).await {
+                                Ok(cm) => target_configmaps.insert(target.name, cm),
+                                Err(err) => {
+                                    error!("{err}");
+                                    return Err(Error::KubeError(err));
+                                }
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        error!("{err}");
+                        return Err(Error::KubeError(err));
+                    }
+                };
+            }
+        }
+    }
+    Ok((target_secrets, target_configmaps))
+}
+
+fn build_owner_refenerce(object: ConfigSet) -> Vec<OwnerReference> {
+    let owner_reference = OwnerReference {
+        api_version: ConfigSet::api_version(&()).to_string(),
+        kind: ConfigSet::kind(&()).to_string(),
+        name: object.metadata.name.unwrap(),
+        uid: object.metadata.uid.unwrap(),
+        ..Default::default()
+    };
+    vec![owner_reference]
+}
+
+fn build_templates(
+    templates: Vec<Templates>,
+    target_secrets: &mut HashMap<String, Secret>,
+    target_configmaps: &mut HashMap<String, ConfigMap>,
+    targets: Vec<TargetWithName>,
+    inputs: HashMap<String, String>,
+) -> Result<()> {
+    for template in templates {
+        let reg = Handlebars::new();
+        info!("building template {}", template.name);
+        let var = match reg.render_template(template.template.as_str(), &inputs) {
+            Ok(var) => var,
+            Err(err) => return Err(Error::IllegalConfigSet),
+        };
+        match targets
+            .iter()
+            .find(|target| target.name == template.target)
+            .unwrap()
+            .target
+            .kind
+        {
+            crate::api::v1alpha1::configsets_api::Kinds::Secret => {
+                let sec = target_secrets.get_mut(&template.target).unwrap();
+                let mut byte_var: ByteString = ByteString::default();
+                byte_var.0 = var.as_bytes().to_vec();
+
+                let mut existing_data = match sec.clone().data {
+                    Some(sec) => sec,
+                    None => BTreeMap::new(),
+                };
+                existing_data.insert(template.name, byte_var);
+                sec.data = Some(existing_data);
+            }
+            crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
+                let cm = target_configmaps.get_mut(&template.target).unwrap();
+                let mut existing_data = match cm.clone().data {
+                    Some(cm) => cm,
+                    None => BTreeMap::new(),
+                };
+                existing_data.insert(template.name, var);
+                cm.data = Some(existing_data);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl ConfigSet {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action> {
@@ -93,170 +301,34 @@ impl ConfigSet {
          * Then use them to build new values with templates
          * And then write those values to targets
          */
-        let mut inputs: HashMap<String, String> = HashMap::new();
-        for input in self.spec.inputs.clone() {
-            info!("populating data from input {}", input.name);
-            match input.from.kind {
-                crate::api::v1alpha1::configsets_api::Kinds::Secret => {
-                    let secrets: Api<Secret> = Api::namespaced(
-                        ctx.client.clone(),
-                        self.metadata.namespace.clone().unwrap().as_str(),
-                    );
-                    let secret: String = match secrets.get(&input.from.name).await {
-                        Ok(s) => from_utf8(&s.data.clone().unwrap()[input.from.key.as_str()].0)
-                            .unwrap()
-                            .to_string(),
-                        Err(err) => {
-                            error!("{err}");
-                            return Err(Error::KubeError(err));
-                        }
-                    };
-                    inputs.insert(input.from.key, secret);
-                }
-                crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
-                    let configmaps: Api<ConfigMap> = Api::namespaced(
-                        ctx.client.clone(),
-                        self.metadata.namespace.clone().unwrap().as_str(),
-                    );
-                    let configmap: String = match configmaps.get(&input.from.name).await {
-                        Ok(cm) => {
-                            let data = &cm.data.unwrap()[input.from.key.as_str()];
-                            data.to_string()
-                        }
-                        Err(err) => {
-                            error!("{err}");
-                            return Err(Error::KubeError(err));
-                        }
-                    };
-                    inputs.insert(input.name, configmap);
-                }
-            }
-        }
+        let inputs: HashMap<String, String> = gather_inputs(
+            ctx.client.clone(),
+            self.metadata.namespace.clone().unwrap(),
+            self.spec.inputs.clone(),
+        )
+        .await?;
 
-        let mut target_secrets: HashMap<String, Secret> = HashMap::new();
-        let mut target_configmaps: HashMap<String, ConfigMap> = HashMap::new();
+        let owner_reference = build_owner_refenerce(self.clone());
 
-        for target in self.spec.targets.clone() {
-            match target.target.kind {
-                crate::api::v1alpha1::configsets_api::Kinds::Secret => {
-                    let secrets: Api<Secret> = Api::namespaced(
-                        ctx.client.clone(),
-                        self.metadata.namespace.clone().unwrap().as_str(),
-                    );
-                    match secrets.get_opt(&target.target.name).await {
-                        Ok(sec_opt) => match sec_opt {
-                            Some(sec) => target_secrets.insert(target.name, sec),
-                            None => {
-                                let empty_data: BTreeMap<String, ByteString> = BTreeMap::new();
-                                let new_secret: Secret = Secret {
-                                    data: Some(empty_data),
-                                    metadata: ObjectMeta {
-                                        name: Some(target.target.name),
-                                        namespace: self.metadata.namespace.clone(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                };
-                                match secrets.create(&PostParams::default(), &new_secret).await {
-                                    Ok(sec) => target_secrets.insert(target.name, sec),
-                                    Err(err) => {
-                                        error!("{err}");
-                                        return Err(Error::KubeError(err));
-                                    }
-                                }
-                            }
-                        },
-                        Err(err) => {
-                            error!("{err}");
-                            return Err(Error::KubeError(err));
-                        }
-                    };
-                }
-                crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
-                    let configmaps: Api<ConfigMap> = Api::namespaced(
-                        ctx.client.clone(),
-                        self.metadata.namespace.clone().unwrap().as_str(),
-                    );
-                    match configmaps.get_opt(&target.target.name).await {
-                        Ok(cm_opt) => match cm_opt {
-                            Some(cm) => target_configmaps.insert(target.name, cm),
-                            None => {
-                                let empty_data: BTreeMap<String, String> = BTreeMap::new();
-                                let new_configmap: ConfigMap = ConfigMap {
-                                    data: Some(empty_data),
-                                    metadata: ObjectMeta {
-                                        name: Some(target.target.name),
-                                        namespace: self.metadata.namespace.clone(),
-                                        ..Default::default()
-                                    },
-                                    ..Default::default()
-                                };
-                                match configmaps
-                                    .create(&PostParams::default(), &new_configmap)
-                                    .await
-                                {
-                                    Ok(cm) => target_configmaps.insert(target.name, cm),
-                                    Err(err) => {
-                                        error!("{err}");
-                                        return Err(Error::KubeError(err));
-                                    }
-                                }
-                            }
-                        },
-                        Err(err) => {
-                            error!("{err}");
-                            return Err(Error::KubeError(err));
-                        }
-                    };
-                }
-            }
-        }
+        let (mut target_secrets, mut target_configmaps) = gather_targets(
+            ctx.client.clone(),
+            self.metadata.namespace.clone().unwrap(),
+            self.spec.targets.clone(),
+            owner_reference,
+        )
+        .await?;
 
-        let mut templates: HashMap<String, String> = HashMap::new();
-        for template in self.spec.templates.clone() {
-            let reg = Handlebars::new();
-            info!("building template {}", template.name);
-            let var = reg
-                .render_template(template.template.as_str(), &inputs)
-                .unwrap();
-            match self
-                .spec
-                .targets
-                .iter()
-                .find(|target| target.name == template.target)
-                .unwrap()
-                .target
-                .kind
-            {
-                crate::api::v1alpha1::configsets_api::Kinds::Secret => {
-                    let sec = target_secrets.get_mut(&template.target).unwrap();
-                    let mut byte_var: ByteString = ByteString::default();
-                    byte_var.0 = var.as_bytes().to_vec();
-
-                    let mut existing_data = match sec.clone().data {
-                        Some(sec) => sec,
-                        None => BTreeMap::new(),
-                    };
-                    existing_data.insert(template.name, byte_var);
-                    sec.data = Some(existing_data);
-                }
-                crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
-                    let cm = target_configmaps.get_mut(&template.target).unwrap();
-                    let mut existing_data = match cm.clone().data {
-                        Some(cm) => cm,
-                        None => BTreeMap::new(),
-                    };
-                    existing_data.insert(template.name, var);
-                    cm.data = Some(existing_data);
-                }
-            }
-        }
+        build_templates(
+            self.spec.templates.clone(),
+            &mut target_secrets,
+            &mut target_configmaps,
+            self.spec.targets.clone(),
+            inputs.clone(),
+        );
 
         for (_, value) in target_secrets {
-            let secrets: Api<Secret> = Api::namespaced(
-                ctx.client.clone(),
-                self.metadata.namespace.clone().unwrap().as_str(),
-            );
+            let secrets =
+                get_secret_api(ctx.client.clone(), self.metadata.namespace.clone().unwrap());
             match secrets
                 .replace(
                     value.metadata.name.clone().unwrap().as_str(),
@@ -275,10 +347,8 @@ impl ConfigSet {
             };
         }
         for (_, value) in target_configmaps {
-            let configmaps: Api<ConfigMap> = Api::namespaced(
-                ctx.client.clone(),
-                self.metadata.namespace.clone().unwrap().as_str(),
-            );
+            let configmaps =
+                get_configmap_api(ctx.client.clone(), self.metadata.namespace.clone().unwrap());
             match configmaps
                 .replace(
                     value.metadata.name.clone().unwrap().as_str(),
