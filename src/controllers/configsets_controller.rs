@@ -1,6 +1,7 @@
 use crate::api::v1alpha1::configsets_api::{
     ConfigSet, Input, InputWithName, TargetWithName, Templates,
 };
+use core::fmt;
 use futures::StreamExt;
 use handlebars::Handlebars;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
@@ -10,11 +11,12 @@ use kube::api::{ListParams, PostParams};
 use kube::core::{Object, ObjectMeta};
 use kube::error::ErrorResponse;
 use kube::runtime::controller::Action;
+use kube::runtime::finalizer::Event as Finalizer;
 use kube::runtime::watcher::Config;
-use kube::runtime::Controller;
+use kube::runtime::{finalizer, Controller};
 use kube::{Api, Client, CustomResource};
 use kube_client::core::DynamicObject;
-use kube_client::Resource;
+use kube_client::{Resource, ResourceExt};
 use log::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -24,11 +26,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
+static WATCHED_BY_SHU: &str = "badhouseplants.net/watched-by-shu";
+static SHU_FINALIZER: &str = "badhouseplants.net/shu-cleanup";
+
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("SerializationError: {0}")]
-    SerializationError(#[source] serde_json::Error),
-
     #[error("Kube Error: {0}")]
     KubeError(#[source] kube::Error),
 
@@ -37,15 +39,11 @@ pub enum Error {
     // so boxing this error to break cycles
     FinalizerError(#[source] Box<kube::runtime::finalizer::Error<Error>>),
 
-    #[error("IllegalConfigSet")]
-    IllegalConfigSet,
+    #[error("IllegalConfigSet: {0}")]
+    IllegalConfigSet(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-impl Error {
-    pub fn metric_label(&self) -> String {
-        format!("{self:?}").to_lowercase()
-    }
-}
+
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 // Context for our reconciler
 #[derive(Clone)]
@@ -55,16 +53,39 @@ pub struct Context {
 }
 
 async fn reconcile(csupstream: Arc<ConfigSet>, ctx: Arc<Context>) -> Result<Action> {
-    let cs = csupstream.clone();
-    info!(
-        "reconciling {} - {}",
-        cs.metadata.name.clone().unwrap(),
-        cs.metadata.namespace.clone().unwrap()
-    );
-    match cs.metadata.deletion_timestamp {
-        Some(_) => return cs.cleanup(ctx).await,
-        None => return cs.reconcile(ctx).await,
-    }
+    let ns = csupstream.namespace().unwrap();
+    let confset: Api<ConfigSet> = Api::namespaced(ctx.client.clone(), &ns);
+    finalizer(&confset, SHU_FINALIZER, csupstream.clone(), |event| async {
+        info!(
+            "reconciling {} - {}",
+            csupstream.metadata.name.clone().unwrap(),
+            csupstream.metadata.namespace.clone().unwrap()
+        );
+        match event {
+            Finalizer::Apply(doc) => match csupstream.reconcile(ctx.clone()).await {
+                Ok(res) => {
+                    info!("reconciled successfully");
+                    Ok(res)
+                }
+                Err(err) => {
+                    error!("reconciliation has failed with error: {}", err);
+                    Err(err)
+                }
+            },
+            Finalizer::Cleanup(doc) => match csupstream.cleanup(ctx.clone()).await {
+                Ok(res) => {
+                    info!("cleaned up successfully");
+                    Ok(res)
+                }
+                Err(err) => {
+                    error!("cleanup has failed with error: {}", err);
+                    Err(err)
+                }
+            },
+        }
+    })
+    .await
+    .map_err(|e| Error::FinalizerError(Box::new(e)))
 }
 
 /// Initialize the controller and shared state (given the crd is installed)
@@ -118,9 +139,14 @@ async fn gather_inputs(
                         let value = match data.get(i.from.key.as_str()) {
                             Some(data) => match from_utf8(&data.0) {
                                 Ok(data) => data,
-                                Err(_) => return Err(Error::IllegalConfigSet),
+                                Err(err) => return Err(Error::IllegalConfigSet(Box::from(err))),
                             },
-                            None => return Err(Error::IllegalConfigSet),
+                            None => {
+                                return Err(Error::IllegalConfigSet(Box::from(format!(
+                                    "value is not set for the key: {}",
+                                    i.from.key
+                                ))))
+                            }
                         };
                         value.to_string()
                     }
@@ -140,7 +166,12 @@ async fn gather_inputs(
                         let data = cm.data.unwrap();
                         let value = match data.get(i.from.key.as_str()) {
                             Some(data) => data,
-                            None => return Err(Error::IllegalConfigSet),
+                            None => {
+                                return Err(Error::IllegalConfigSet(Box::from(format!(
+                                    "value is not set for the key: {}",
+                                    i.from.key
+                                ))))
+                            }
                         };
                         value.to_string()
                     }
@@ -252,21 +283,27 @@ fn build_templates(
     target_configmaps: &mut HashMap<String, ConfigMap>,
     targets: Vec<TargetWithName>,
     inputs: HashMap<String, String>,
+    confset_name: String,
 ) -> Result<()> {
     for template in templates {
         let reg = Handlebars::new();
         info!("building template {}", template.name);
         let var = match reg.render_template(template.template.as_str(), &inputs) {
             Ok(var) => var,
-            Err(err) => return Err(Error::IllegalConfigSet),
+            Err(err) => return Err(Error::IllegalConfigSet(Box::from(err))),
         };
-        match targets
-            .iter()
-            .find(|target| target.name == template.target)
-            .unwrap()
-            .target
-            .kind
-        {
+
+        let target = match targets.iter().find(|target| target.name == template.target) {
+            Some(target) => target,
+            None => {
+                return Err(Error::IllegalConfigSet(Box::from(format!(
+                    "target not found {}",
+                    template.target
+                ))));
+            }
+        };
+
+        match target.target.kind {
             crate::api::v1alpha1::configsets_api::Kinds::Secret => {
                 let sec = target_secrets.get_mut(&template.target).unwrap();
                 let mut byte_var: ByteString = ByteString::default();
@@ -278,6 +315,12 @@ fn build_templates(
                 };
                 existing_data.insert(template.name, byte_var);
                 sec.data = Some(existing_data);
+                let mut existing_annotations = match sec.metadata.annotations.clone() {
+                    Some(ann) => ann,
+                    None => BTreeMap::new(),
+                };
+                existing_annotations.insert(WATCHED_BY_SHU.to_string(), confset_name.clone());
+                sec.metadata.annotations = Some(existing_annotations);
             }
             crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
                 let cm = target_configmaps.get_mut(&template.target).unwrap();
@@ -287,6 +330,58 @@ fn build_templates(
                 };
                 existing_data.insert(template.name, var);
                 cm.data = Some(existing_data);
+                let mut existing_annotations = match cm.metadata.annotations.clone() {
+                    Some(ann) => ann,
+                    None => BTreeMap::new(),
+                };
+                existing_annotations.insert(WATCHED_BY_SHU.to_string(), confset_name.clone());
+                cm.metadata.annotations = Some(existing_annotations);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_templates(
+    templates: Vec<Templates>,
+    target_secrets: &mut HashMap<String, Secret>,
+    target_configmaps: &mut HashMap<String, ConfigMap>,
+    targets: Vec<TargetWithName>,
+) -> Result<()> {
+    for template in templates {
+        info!("cleaning template {}", template.name);
+        let target = match targets.iter().find(|target| target.name == template.target) {
+            Some(target) => target,
+            None => {
+                return Err(Error::IllegalConfigSet(Box::from(format!(
+                    "target not found {}",
+                    template.target
+                ))));
+            }
+        };
+
+        match target.target.kind {
+            crate::api::v1alpha1::configsets_api::Kinds::Secret => {
+                let sec = target_secrets.get_mut(&template.target).unwrap();
+                if let Some(mut existing_data) = sec.clone().data {
+                    existing_data.remove(&template.name);
+                    sec.data = Some(existing_data)
+                }
+                if let Some(mut existing_annotations) = sec.metadata.clone().annotations {
+                    existing_annotations.remove(WATCHED_BY_SHU);
+                    sec.metadata.annotations = Some(existing_annotations);
+                }
+            }
+            crate::api::v1alpha1::configsets_api::Kinds::ConfigMap => {
+                let cm = target_configmaps.get_mut(&template.target).unwrap();
+                if let Some(mut existing_data) = cm.clone().data {
+                    existing_data.remove(&template.name);
+                    cm.data = Some(existing_data);
+                }
+                if let Some(mut existing_annotations) = cm.metadata.clone().annotations {
+                    existing_annotations.remove(WATCHED_BY_SHU);
+                    cm.metadata.annotations = Some(existing_annotations);
+                }
             }
         }
     }
@@ -301,6 +396,7 @@ impl ConfigSet {
          * Then use them to build new values with templates
          * And then write those values to targets
          */
+
         let inputs: HashMap<String, String> = gather_inputs(
             ctx.client.clone(),
             self.metadata.namespace.clone().unwrap(),
@@ -324,7 +420,8 @@ impl ConfigSet {
             &mut target_configmaps,
             self.spec.targets.clone(),
             inputs.clone(),
-        );
+            self.metadata.name.clone().unwrap(),
+        )?;
 
         for (_, value) in target_secrets {
             let secrets =
@@ -371,6 +468,69 @@ impl ConfigSet {
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action> {
+        let inputs: HashMap<String, String> = gather_inputs(
+            ctx.client.clone(),
+            self.metadata.namespace.clone().unwrap(),
+            self.spec.inputs.clone(),
+        )
+        .await?;
+
+        let owner_reference = build_owner_refenerce(self.clone());
+
+        let (mut target_secrets, mut target_configmaps) = gather_targets(
+            ctx.client.clone(),
+            self.metadata.namespace.clone().unwrap(),
+            self.spec.targets.clone(),
+            owner_reference,
+        )
+        .await?;
+        cleanup_templates(
+            self.spec.templates.clone(),
+            &mut target_secrets,
+            &mut target_configmaps,
+            self.spec.targets.clone(),
+        )?;
+
+        for (_, value) in target_secrets {
+            let secrets =
+                get_secret_api(ctx.client.clone(), self.metadata.namespace.clone().unwrap());
+            match secrets
+                .replace(
+                    value.metadata.name.clone().unwrap().as_str(),
+                    &PostParams::default(),
+                    &value,
+                )
+                .await
+            {
+                Ok(sec) => {
+                    info!("secret {} is updated", sec.metadata.name.unwrap());
+                }
+                Err(err) => {
+                    error!("{}", err);
+                    return Err(Error::KubeError(err));
+                }
+            };
+        }
+        for (_, value) in target_configmaps {
+            let configmaps =
+                get_configmap_api(ctx.client.clone(), self.metadata.namespace.clone().unwrap());
+            match configmaps
+                .replace(
+                    value.metadata.name.clone().unwrap().as_str(),
+                    &PostParams::default(),
+                    &value,
+                )
+                .await
+            {
+                Ok(sec) => {
+                    info!("secret {} is updated", sec.metadata.name.unwrap());
+                }
+                Err(err) => {
+                    error!("{}", err);
+                    return Err(Error::KubeError(err));
+                }
+            };
+        }
         Ok::<Action, Error>(Action::await_change())
     }
 }

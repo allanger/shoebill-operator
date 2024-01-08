@@ -9,6 +9,10 @@ spec:
       target:
         kind: Secret
         name: app-connection-string
+    - name: existing-target
+      target:
+        kind: Secret
+        name: database-secret
   inputs:
     - name: PROTO
       from:
@@ -34,6 +38,9 @@ spec:
     - name: CONNECTION
       template: "{{ PROTO }}:{{ USERNAME }}:{{ PASSWORD }}/{{ DATABASE }}"
       target: app-connection-string
+    - name: EXISTING
+      template: TEST
+      target: existing-target
     - name: IS_POSTGRES
       template: |
         {{#if (eq PROTO "postgresql") }}
